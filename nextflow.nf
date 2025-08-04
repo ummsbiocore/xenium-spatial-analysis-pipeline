@@ -16,17 +16,24 @@ output:
  path "output"  ,emit:g_5_outputDir00_g_0 
 
 
-script:
-"""
-	mkdir output 
+container "quay.io/viascientific/initialrun-docker:3.2"
 
-	unzip ${zipfile} -d output/
-	
-	tar xzvf output/cell_feature_matrix.tar.gz
-	mv cell_feature_matrix output/
+script:
+
+"""
+#!/usr/bin/env bash
+
+mkdir output 
+
+unzip ${zipfile} -d output/
+
+tar xzvf output/cell_feature_matrix.tar.gz
+mv cell_feature_matrix output/
+
+if [ -f "output/aux_outputs.tar.gz" ]; then
 	tar xzvf output/aux_outputs.tar.gz
 	mv aux_outputs output/
-	
+fi
 """
 }
 
@@ -41,6 +48,9 @@ input:
 output:
  path "Output.rds"  ,emit:g_0_rdsFile00 
  path "Analysis_Report.html"  ,emit:g_0_outputHTML11 
+
+container "quay.io/viascientific/scrna-seurat-v5:1.0"
+
 
 script:
 
