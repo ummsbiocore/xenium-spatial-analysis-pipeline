@@ -3,11 +3,18 @@ params.outdir = 'results'
 
 
 if (!params.samplesheet){params.samplesheet = ""} 
+if (!params.metadatasheet){params.metadatasheet = ""} 
 
 if (params.samplesheet){
    Channel.fromPath(params.samplesheet, type: 'any').map{ file -> tuple(file.baseName, file) }.set{g_7_0_g_5}
 } else {
 	g_7_0_g_5 = Channel.empty()
+}
+g_9_1_g_0 = file(params.metadatasheet, type: 'any')
+if (params.metadatasheet){
+   Channel.fromPath(params.metadatasheet, type: 'any').map{ file -> tuple(file.baseName, file) }.set{g_9_2_g_0}
+} else {
+	g_9_2_g_0 = Channel.empty()
 }
 
 
@@ -97,6 +104,8 @@ publishDir params.outdir, mode: 'copy', saveAs: {filename -> if (filename =~ /${
 publishDir params.outdir, mode: 'copy', saveAs: {filename -> if (filename =~ /${sample_name}.analysis_report.html$/) "HTML_Report/$filename"}
 input:
  tuple val(sample_name), file(Xenium_input)
+ path metadatasheet
+ tuple val(all), file(cellstats_file)
 
 output:
  path "${sample_name}.analysis.rds"  ,emit:g_0_rdsFile00 
@@ -153,7 +162,7 @@ Xenium_Download_Dataset(g_7_0_g_5.map{i-> return i[1]}.splitCsv(header: true, se
 g_5_outputDir00_g_0 = Xenium_Download_Dataset.out.g_5_outputDir00_g_0
 
 
-Xenium_Data_Analysis(g_5_outputDir00_g_0)
+Xenium_Data_Analysis(g_5_outputDir00_g_0,g_9_1_g_0,g_9_2_g_0.flatten().splitCsv(header:true, sep:'\t').map { row -> file(row.cell_stats_path) }.toList().map { list -> tuple('all', list) })
 g_0_rdsFile00 = Xenium_Data_Analysis.out.g_0_rdsFile00
 g_0_outputHTML11 = Xenium_Data_Analysis.out.g_0_outputHTML11
 
