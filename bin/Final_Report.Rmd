@@ -1,0 +1,368 @@
+---
+title: "Xenium Data Analysis Report"
+author: ""
+output: 
+  html_document:
+    toc: true
+    toc_float:
+      toc_collapsed: true
+      toc_depth: 3
+    number_sections: true
+    fig_caption: yes
+    theme: cerulean
+    code_folding: hide
+editor_options: 
+  chunk_output_type: console
+params:
+  Xenium_output: './'
+  lower_threshold: 0.05
+  higher_threshold: 0.95
+  cell_stats_path: NULL
+  metadata_sheet_path: NULL
+  sample_name: NULL
+  segmentations: NULL
+---
+
+```{r setup, include=FALSE}
+
+suppressPackageStartupMessages({
+library(Seurat)
+library(ggplot2)
+library(clustree)
+library(dplyr)
+#BiocManager::install("RBioFormats")
+#library(RBioFormats)
+#install.packages('magick',repo = 'https://cran.rstudio.com')
+#library(magick)
+})
+
+```
+
+# Read in samples
+
+If the data is a raw Count Matrix, meaning that the empty droplets are not filtered out by cellranger pipeline or Drop-Seq pipeline, the emptyDrops algorithm from DropUtils will be run in order to remove the empty droplets.
+
+```{r read in samples,error=FALSE,warning=FALSE,message=FALSE,results=FALSE,echo=FALSE}
+
+if(!is.null(params$segmentations) && !is.na(params$segmentations) && params$segmentations != 'none'){
+  Data=Seurat::LoadXenium(params$Xenium_output, segmentations = params$segmentations)
+} else {
+  Data=Seurat::LoadXenium(params$Xenium_output)
+}
+
+
+metadata=read.csv(paste0(params$Xenium_output,'/cells.csv.gz'),header=T,row.names=1)
+
+## Read and process metadata sheet
+metadata_sheet <- if (!is.null(params$metadata_sheet_path) && !is.na(params$metadata_sheet_path)) {
+  tryCatch({
+    sheet <- read.delim(params$metadata_sheet_path, sep="\t", header=TRUE)
+    message("Successfully read metadata sheet")
+    
+    if (!is.null(params$sample_name) && !is.na(params$sample_name)) {
+      sheet <- sheet[sheet$sample_name == params$sample_name, ]
+      if (nrow(sheet) == 0) warning(sprintf("No rows found for sample name: %s", params$sample_name))
+    }
+    sheet
+  }, error = function(e) {
+    warning(sprintf("Error reading metadata sheet: %s", e$message))
+    NULL
+  })
+} else {
+  message("No metadata sheet path provided")
+  NULL
+}
+
+# Process cell stats if both metadata sheet and stats path exist
+combined_stats <- if (!is.null(metadata_sheet) && !is.null(params$cell_stats_path) && !is.na(params$cell_stats_path)) {
+  stats_list <- list()
+  metadata_cols <- c("condition", "replicate", "tissue")
+  
+  for (i in 1:nrow(metadata_sheet)) {
+    cell_stats_file <- metadata_sheet$cell_stats_path[i]
+    if (is.null(cell_stats_file) || is.na(cell_stats_file) || cell_stats_file == "") next
+    
+    full_path <- file.path(params$cell_stats_path, basename(cell_stats_file))
+    if (!file.exists(full_path)) stop(sprintf("Cell stats file not found: %s", full_path))
+    
+    # Debug: Check file structure before reading
+    message(sprintf("Reading cell stats file: %s", full_path))
+    
+    # Skip first two lines and read header from third line
+    lines <- readLines(full_path)
+    header_line <- strsplit(lines[3], ",")[[1]]
+    message("Header from line 3:")
+    message(header_line)
+    
+    # Count columns in header vs data
+    header_cols <- length(header_line)
+    if (length(lines) > 3) {
+      data_cols <- length(strsplit(lines[4], ",")[[1]])
+      message(sprintf("Header columns: %d, Data columns: %d", header_cols, data_cols))
+    }
+    
+    # Try reading with different options, skipping first two lines
+    tryCatch({
+      stats_data <- read.csv(full_path, skip = 2, check.names = FALSE)
+    }, error = function(e) {
+      message(sprintf("Error with default read.csv: %s", e$message))
+      # Try with different separators
+      tryCatch({
+        stats_data <<- read.csv(full_path, skip = 2, sep = "\t", check.names = FALSE)
+        message("Successfully read with tab separator")
+      }, error = function(e2) {
+        message(sprintf("Error with tab separator: %s", e2$message))
+        # Try reading with fill = TRUE to handle missing columns
+        tryCatch({
+          stats_data <<- read.csv(full_path, skip = 2, fill = TRUE, check.names = FALSE)
+          message("Successfully read with fill = TRUE")
+        }, error = function(e3) {
+          message(sprintf("Error with fill = TRUE: %s", e3$message))
+          # Try reading without header
+          tryCatch({
+            stats_data <<- read.csv(full_path, skip = 2, header = FALSE, check.names = FALSE)
+            message("Successfully read without header")
+          }, error = function(e4) {
+            # Last resort: read as text and manually parse
+            message("Attempting manual parsing...")
+            lines <- readLines(full_path)
+            if (length(lines) > 3) {
+              # Use the third line as header, pad with generic names if needed
+              header_line <- strsplit(lines[3], ",")[[1]]
+              max_cols <- max(sapply(lines[4:length(lines)], function(x) length(strsplit(x, ",")[[1]])))
+              
+              if (length(header_line) < max_cols) {
+                # Pad header with generic column names
+                additional_cols <- paste0("V", (length(header_line) + 1):max_cols)
+                header_line <- c(header_line, additional_cols)
+                message(sprintf("Padded header with %d additional column names", length(additional_cols)))
+              }
+              
+              # Create a temporary file with corrected header and data
+              temp_file <- tempfile(fileext = ".csv")
+              writeLines(c(paste(header_line, collapse = ","), lines[4:length(lines)]), temp_file)
+              stats_data <<- read.csv(temp_file, check.names = FALSE)
+              unlink(temp_file)
+              message("Successfully read with manual header correction")
+            } else {
+              stop("File appears to be empty or has fewer than 3 lines")
+            }
+          })
+        })
+      })
+    })
+    for (col in metadata_cols) {
+      if (!is.null(metadata_sheet[[col]][i]) && !is.na(metadata_sheet[[col]][i]) && metadata_sheet[[col]][i] != "") {
+        stats_data[[col]] <- metadata_sheet[[col]][i]
+      }
+    }
+    stats_list[[i]] <- stats_data
+  }
+  do.call(rbind, stats_list)
+} else NULL
+
+# Merge metadata with combined stats if they exist
+if (!is.null(combined_stats)) {
+  # Debug: Check dimensions
+  message(sprintf("Metadata dimensions: %d rows, %d cols", nrow(metadata), ncol(metadata)))
+  message(sprintf("Combined stats dimensions: %d rows, %d cols", nrow(combined_stats), ncol(combined_stats)))
+  message("Combined stats column names:")
+  message(paste(colnames(combined_stats), collapse = ", "))
+  
+  # Add cell_id columns
+  metadata$cell_id <- rownames(metadata)
+  
+  # Check if combined_stats has a cell identifier column and standardize it
+  if ("Cell ID" %in% colnames(combined_stats)) {
+    # Rename 'Cell ID' to 'cell_id' for consistency
+    colnames(combined_stats)[colnames(combined_stats) == "Cell ID"] <- "cell_id"
+    message("Renamed 'Cell ID' column to 'cell_id' in combined_stats")
+  } else if (!"cell_id" %in% colnames(combined_stats)) {
+    # If no cell_id column exists, we can't merge without cell identifiers
+    warning("No cell identifier column found in combined_stats - cannot merge")
+    updated_metadata <- metadata
+  } else {
+    # combined_stats already has cell_id, use it as is
+    message("Using existing cell_id column from combined_stats")
+  }
+  
+  # Proceed with merge if combined_stats has a cell_id column
+  if ("cell_id" %in% colnames(combined_stats)) {
+    # Check for overlap between cell IDs
+    metadata_cell_ids <- metadata$cell_id
+    stats_cell_ids <- combined_stats$cell_id
+    overlap <- intersect(metadata_cell_ids, stats_cell_ids)
+    
+    message(sprintf("Cell ID overlap: %d cells in metadata, %d cells in stats, %d overlapping", 
+                   length(metadata_cell_ids), length(stats_cell_ids), length(overlap)))
+    
+    if (length(overlap) > 0) {
+      # Merge the datasets - this will keep all metadata rows and add stats where available
+      updated_metadata <- merge(metadata, combined_stats, by="cell_id", all.x=TRUE)
+      
+      # Ensure the order matches the original metadata
+      updated_metadata <- updated_metadata[match(metadata$cell_id, updated_metadata$cell_id), ]
+      rownames(updated_metadata) <- updated_metadata$cell_id
+      updated_metadata$cell_id <- NULL
+      
+      message(sprintf("Successfully merged data: %d cells with stats, %d cells without stats", 
+                     sum(!is.na(updated_metadata[, ncol(updated_metadata)])), 
+                     sum(is.na(updated_metadata[, ncol(updated_metadata)]))))
+    } else {
+      warning("No overlapping cell IDs found between metadata and combined_stats - using metadata only")
+      updated_metadata <- metadata
+    }
+  } else {
+    updated_metadata <- metadata
+  }
+} else {
+  updated_metadata <- metadata
+}
+
+Data <- AddMetaData(Data, updated_metadata)
+
+Data=subset(Data,subset=nCount_Xenium>0&nFeature_Xenium>0)
+Data=subset(Data,subset=nCount_Xenium>as.numeric(quantile(Data$nCount_Xenium,params$lower_threshold))&
+              nCount_Xenium<as.numeric(quantile(Data$nCount_Xenium,params$higher_threshold))&
+              nFeature_Xenium>as.numeric(quantile(Data$nFeature_Xenium,params$lower_threshold))&
+              nFeature_Xenium<as.numeric(quantile(Data$nFeature_Xenium,params$higher_threshold)))
+
+#Data@misc$background.image=background
+
+```
+
+# QC {.tabset}
+
+In this tab the correlation between number of genes, and number of UMIs and area of cells will be visualized
+
+## Number of Genes per Cells
+
+```{r Number of Genes per Cells, fig.width=10,fig.height=10,error=FALSE,warning=FALSE,message=FALSE,results=FALSE,echo=FALSE}
+
+VlnPlot(Data,'nFeature_Xenium',pt.size = 0)
+
+```
+
+## Number of UMIs per Cells
+
+```{r Number of UMIs per Cells, fig.width=10,fig.height=10,error=FALSE,warning=FALSE,message=FALSE,results=FALSE,echo=FALSE}
+
+VlnPlot(Data,'nCount_Xenium',pt.size = 0)
+
+p3 = FeatureScatter(Data, 'nFeature_Xenium','nCount_Xenium',raster = T)
+
+```
+
+## Correlation between number of Genes and UMIs
+
+```{r Correlation between number of Genes and UMIs, fig.width=10,fig.height=10,error=FALSE,warning=FALSE,message=FALSE,results=FALSE,echo=FALSE}
+
+FeatureScatter(Data, 'nFeature_Xenium','nCount_Xenium',raster = T)
+
+```
+
+# Analysis
+
+This tab will do the normalization, dimension reduction and parameter optmization.
+
+## PCA and selecting number of PCs for UMAP and Clustering
+
+```{r PCA, fig.width=5,fig.height=5,error=FALSE,warning=FALSE,message=FALSE,results=FALSE,echo=FALSE}
+
+Data=SCTransform(Data,assay = 'Xenium')
+
+Data=RunPCA(Data,npcs = 100,assay = 'SCT')
+
+candidates=abs(diff(Data@reductions$pca@stdev))
+
+candidates=which(candidates>mean(candidates))
+
+candidates=max(candidates)
+
+plot(Data@reductions$pca@stdev)+abline(v=(candidates+1))
+
+
+```
+
+## Clustering {.tabset}
+
+```{r Clustering, fig.width=10,fig.height=10,error=FALSE,warning=FALSE,message=FALSE,results=FALSE,echo=FALSE}
+
+Data=RunUMAP(Data,dims = 1:(candidates+1))
+
+Data=FindNeighbors(Data,dims = 1:(candidates+1))
+
+Data=FindClusters(Data,resolution = seq(2.0,0.1,-0.1))
+
+
+names=paste0(DefaultAssay(Data),'_snn_res.')
+SC3_Stability=clustree(Data,prefix = names)
+SC3_Stability.results=SC3_Stability$data
+SC3_Stability.results=SC3_Stability.results[,c(names,'sc3_stability')]
+colnames(SC3_Stability.results)[1]='resolution'
+SC3_Stability.results.mean=aggregate(sc3_stability~resolution,SC3_Stability.results,mean)
+colnames(SC3_Stability.results.mean)[2]='sc3_stability_mean'
+
+candidates=abs(diff(SC3_Stability.results.mean$sc3_stability_mean))
+candidates=which(candidates>mean(candidates))
+
+Idents(Data)=paste0(DefaultAssay(Data),'_snn_res.',SC3_Stability.results.mean$resolution[max(candidates)])
+
+Data$seurat_clusters=Idents(Data)
+
+Data=BuildNicheAssay(Data,fov = 'fov',group.by = 'seurat_clusters')
+
+Data$niches=as.factor(Data$niches)
+
+DefaultAssay(Data)='Xenium'
+
+
+Data=NormalizeData(Data,assay='Xenium')
+
+
+Data.markers=FindAllMarkers(Data,assay='Xenium',only.pos = T)
+
+saveRDS(Data,"Output.rds")
+```
+
+### UMAP of Clusters
+
+```{r UMAP of Clusters, fig.width=10,fig.height=10,error=FALSE,warning=FALSE,message=FALSE,results=FALSE,echo=FALSE}
+
+DimPlot(Data)
+
+```
+
+### UMAP of Niches
+
+```{r UMAP of Niches, fig.width=10,fig.height=10,error=FALSE,warning=FALSE,message=FALSE,results=FALSE,echo=FALSE}
+
+DimPlot(Data,group.by='niches')
+
+```
+
+### Spatial plot of clusters
+
+```{r Spatial plot of clusters, fig.width=10,fig.height=10,error=FALSE,warning=FALSE,message=FALSE,results=FALSE,echo=FALSE}
+
+ImageDimPlot(Data,cols = "polychrome",dark.background = T,group.by='seurat_clusters')
+
+```
+
+### Spatial plot of Niches
+
+```{r Spatial plot of Niches, fig.width=10,fig.height=10,error=FALSE,warning=FALSE,message=FALSE,results=FALSE,echo=FALSE}
+
+ImageDimPlot(Data,cols = "polychrome",dark.background = T,group.by='niches')
+
+```
+
+## Cluster Markers
+
+```{r Top gene markers for clusters,error=FALSE,warning=FALSE,message=FALSE,echo=FALSE}
+
+top10 = Data.markers %>% group_by(cluster) %>% top_n(n = 10, wt = avg_log2FC)
+
+DT::datatable(top10,filter = "top",options = list(autoWidth = TRUE))
+
+```
