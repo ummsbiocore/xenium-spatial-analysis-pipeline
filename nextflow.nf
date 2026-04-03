@@ -26,7 +26,7 @@ input:
 output:
  tuple val(sample_name), file("${sample_name}_out")  ,emit:g_5_outputDir00_g_0 
 
-container "quay.io/viascientific/initialrun-docker:3.2"
+container "quay.io/ummsbiocore/initialrun-docker:3.2"
 
 script:
 
