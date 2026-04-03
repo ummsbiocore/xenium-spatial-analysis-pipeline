@@ -1,0 +1,193 @@
+---
+title: "Xenium Data Analysis Report"
+author: "Via Scientific"
+output: 
+  html_document:
+    toc: true
+    toc_float:
+      toc_collapsed: true
+      toc_depth: 3
+    number_sections: true
+    fig_caption: yes
+    theme: cerulean
+    code_folding: hide
+editor_options: 
+  chunk_output_type: console
+params:
+  Xenium_output: './'
+  lower_threshold: 0.05
+  higher_threshold: 0.95
+---
+
+```{r setup, include=FALSE}
+
+suppressPackageStartupMessages({
+library(Seurat)
+library(ggplot2)
+library(clustree)
+library(dplyr)
+#BiocManager::install("RBioFormats")
+#library(RBioFormats)
+#install.packages('magick',repo = 'https://cran.rstudio.com')
+#library(magick)
+})
+
+```
+
+# Read in samples
+
+If the data is a raw Count Matrix, meaning that the empty droplets are not filtered out by cellranger pipeline or Drop-Seq pipeline, the emptyDrops algorithm from DropUtils will be run in order to remove the empty droplets.
+
+```{r read in samples,error=FALSE,warning=FALSE,message=FALSE,results=FALSE,echo=FALSE}
+
+Data=Seurat::LoadXenium(params$Xenium_output)
+
+metadata=read.csv(paste0(params$Xenium_output,'/cells.csv.gz'),header=T,row.names=1)
+
+Data=AddMetaData(Data,metadata)
+
+Data=subset(Data,subset=nCount_Xenium>0&nFeature_Xenium>0)
+Data=subset(Data,subset=nCount_Xenium>as.numeric(quantile(Data$nCount_Xenium,params$lower_threshold))&
+              nCount_Xenium<as.numeric(quantile(Data$nCount_Xenium,params$higher_threshold))&
+              nFeature_Xenium>as.numeric(quantile(Data$nFeature_Xenium,params$lower_threshold))&
+              nFeature_Xenium<as.numeric(quantile(Data$nFeature_Xenium,params$higher_threshold)))
+
+#Data@misc$background.image=background
+
+```
+
+# QC {.tabset}
+
+In this tab the correlation between number of genes, and number of UMIs and area of cells will be visualized
+
+## Number of Genes per Cells
+
+```{r Number of Genes per Cells, fig.width=10,fig.height=10,error=FALSE,warning=FALSE,message=FALSE,results=FALSE,echo=FALSE}
+
+VlnPlot(Data,'nFeature_Xenium',pt.size = 0)
+
+```
+
+## Number of UMIs per Cells
+
+```{r Number of UMIs per Cells, fig.width=10,fig.height=10,error=FALSE,warning=FALSE,message=FALSE,results=FALSE,echo=FALSE}
+
+VlnPlot(Data,'nCount_Xenium',pt.size = 0)
+
+p3 = FeatureScatter(Data, 'nFeature_Xenium','nCount_Xenium',raster = T)
+
+```
+
+## Correlation between number of Genes and UMIs
+
+```{r Correlation between number of Genes and UMIs, fig.width=10,fig.height=10,error=FALSE,warning=FALSE,message=FALSE,results=FALSE,echo=FALSE}
+
+FeatureScatter(Data, 'nFeature_Xenium','nCount_Xenium',raster = T)
+
+```
+
+# Analysis
+
+This tab will do the normalization, dimension reduction and parameter optmization.
+
+## PCA and selecting number of PCs for UMAP and Clustering
+
+```{r PCA, fig.width=5,fig.height=5,error=FALSE,warning=FALSE,message=FALSE,results=FALSE,echo=FALSE}
+
+Data=SCTransform(Data,assay = 'Xenium')
+
+Data=RunPCA(Data,npcs = 100,assay = 'SCT')
+
+candidates=abs(diff(Data@reductions$pca@stdev))
+
+candidates=which(candidates>mean(candidates))
+
+candidates=max(candidates)
+
+plot(Data@reductions$pca@stdev)+abline(v=(candidates+1))
+
+
+```
+
+## Clustering {.tabset}
+
+```{r Clustering, fig.width=10,fig.height=10,error=FALSE,warning=FALSE,message=FALSE,results=FALSE,echo=FALSE}
+
+Data=RunUMAP(Data,dims = 1:(candidates+1),)
+
+Data=FindNeighbors(Data,dims = 1:(candidates+1))
+
+Data=FindClusters(Data,resolution = seq(2.0,0.1,-0.1))
+
+
+names=paste0(DefaultAssay(Data),'_snn_res.')
+SC3_Stability=clustree(Data,prefix = names)
+SC3_Stability.results=SC3_Stability$data
+SC3_Stability.results=SC3_Stability.results[,c(names,'sc3_stability')]
+colnames(SC3_Stability.results)[1]='resolution'
+SC3_Stability.results.mean=aggregate(sc3_stability~resolution,SC3_Stability.results,mean)
+colnames(SC3_Stability.results.mean)[2]='sc3_stability_mean'
+
+candidates=abs(diff(SC3_Stability.results.mean$sc3_stability_mean))
+candidates=which(candidates>mean(candidates))
+
+Idents(Data)=paste0(DefaultAssay(Data),'_snn_res.',SC3_Stability.results.mean$resolution[max(candidates)])
+
+Data$seurat_clusters=Idents(Data)
+
+Data=BuildNicheAssay(Data,fov = 'fov',group.by = 'seurat_clusters')
+
+Data$niches=as.factor(Data$niches)
+
+DefaultAssay(Data)='Xenium'
+
+
+Data=NormalizeData(Data,assay='Xenium')
+
+
+Data.markers=FindAllMarkers(Data,assay='Xenium',only.pos = T)
+
+saveRDS(Data,"Output.rds")
+```
+
+### UMAP of Clusters
+
+```{r UMAP of Clusters, fig.width=10,fig.height=10,error=FALSE,warning=FALSE,message=FALSE,results=FALSE,echo=FALSE}
+
+DimPlot(Data)
+
+```
+
+### UMAP of Niches
+
+```{r UMAP of Niches, fig.width=10,fig.height=10,error=FALSE,warning=FALSE,message=FALSE,results=FALSE,echo=FALSE}
+
+DimPlot(Data,group.by='niches')
+
+```
+
+### Spatial plot of clusters
+
+```{r Spatial plot of clusters, fig.width=10,fig.height=10,error=FALSE,warning=FALSE,message=FALSE,results=FALSE,echo=FALSE}
+
+ImageDimPlot(Data,cols = "polychrome",dark.background = T,group.by='seurat_clusters')
+
+```
+
+### Spatial plot of Niches
+
+```{r Spatial plot of Niches, fig.width=10,fig.height=10,error=FALSE,warning=FALSE,message=FALSE,results=FALSE,echo=FALSE}
+
+ImageDimPlot(Data,cols = "polychrome",dark.background = T,group.by='niches')
+
+```
+
+## Cluster Markers
+
+```{r Top gene markers for clusters,error=FALSE,warning=FALSE,message=FALSE,echo=FALSE}
+
+top10 = Data.markers %>% group_by(cluster) %>% top_n(n = 10, wt = avg_log2FC)
+
+DT::datatable(top10,filter = "top",options = list(autoWidth = TRUE))
+
+```
